@@ -218,7 +218,7 @@ This can result in long prefixes::
 To remove this long prefix in your shell prompt, modify the env_prompt
 setting in your ``.condarc`` file::
 
-conda config --set env_prompt '({name})'
+  conda config --set env_prompt '({name})'
 
 This will edit your ``.condarc`` file if you already have one
 or create a ``.condarc`` file if you do not.
@@ -257,6 +257,25 @@ command:
 .. note::
    The ``--prune`` option causes conda to remove any dependencies
    that are no longer required from the environment.
+
+.. _frozen-env:
+
+Freezing or locking an environment
+==================================
+
+`CEP 22 <https://conda.org/learn/ceps/cep-0022>`__ introduced an
+environment marker file that will instruct ``conda`` not to allow
+modifications in the given environment. When attempting to add,
+update or remove a package, users will receive an error by default::
+
+   EnvironmentIsFrozenError: Cannot not modify '~/.conda/envs/my-env'.
+   The environment is marked as frozen. You can ignore this error with
+   the `--override-frozen` flag, at your own risk.
+
+As mentioned above, users can pass the ``--override-frozen`` flag, but
+this is really not recommended and should only be done by advanced users
+who are aware of the risks and would have the knowledge to fix potential
+complications derived from that operation.
 
 
 Cloning an environment
@@ -429,9 +448,13 @@ behavior uniform across operating systems. Conda 4.4 allowed
 support so that conda works faster and less disruptively on
 a wide variety of shells (bash, zsh, csh, fish, xonsh, and more).
 Now these shells can use the ``conda activate`` command.
-Removing the need to modify PATH makes conda less disruptive to
-other software on your system. For more information, read the
-output from ``conda init --help``.
+
+Alternatively, ``conda init --condabin`` will not install a shell
+function in your profile. Instead, it will only add the ``$CONDA_PREFIX/condabin/``
+directory to ``PATH``. This directory only contains the ``conda``
+executable, so it should be minimally invasive.
+
+For more information, read the output from ``conda init --help``.
 
 One setting may be useful to you when using ``conda init`` is::
 
@@ -779,11 +802,135 @@ Sharing an environment
 You may want to share your environment with someone else---for
 example, so they can re-create a test that you have done. To
 allow them to quickly reproduce your environment, with all of its
-packages and versions, give them a copy of your
-``environment.yml`` file.
+packages and versions, give them a copy of your environment file.
 
-Exporting the environment.yml file
-----------------------------------
+The recommended way to export conda environments is using the ``conda export`` command,
+which supports multiple formats and provides enhanced functionality:
+
+Exporting environments with conda export
+-----------------------------------------
+
+The ``conda export`` command provides a modern, plugin-based approach to environment export
+with support for multiple output formats.
+
+.. note::
+   The ``conda export`` command has been significantly enhanced in conda 25.7.x with a new
+   plugin-based architecture, multiple export formats, and improved functionality.
+
+**Available Export Formats:**
+
+* ``environment-yaml`` - Cross-platform YAML format (default)
+* ``environment-json`` - Cross-platform JSON format
+* ``explicit`` - Platform-specific explicit URLs (CEP 23 compliant)
+* ``requirements`` - Platform-specific requirements format
+
+Basic Usage
+~~~~~~~~~~~
+
+Export the current environment to YAML format (default):
+
+.. code-block:: bash
+
+   conda export > environment.yaml
+
+Export a specific environment by name:
+
+.. code-block:: bash
+
+   conda export --name myenv --format=environment-yaml
+
+Export using automatic format detection:
+
+.. code-block:: bash
+
+   conda export --file=environment.yaml    # Auto-detects YAML format
+   conda export --file=environment.json    # Auto-detects JSON format
+   conda export --file=explicit.txt        # Auto-detects explicit format
+   conda export --file=requirements.txt    # Auto-detects requirements format
+
+Export Formats in Detail
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Environment YAML Format (Recommended for sharing)**
+
+Best for cross-platform environment sharing:
+
+.. code-block:: bash
+
+   conda export --format=environment-yaml --file=environment.yaml
+
+Creates a file like:
+
+.. code-block:: yaml
+
+   name: myenv
+   channels:
+     - conda-forge
+     - defaults
+   dependencies:
+     - python=3.9
+     - numpy=1.21.0
+     - pandas=1.3.0
+
+**Environment JSON Format**
+
+For programmatic processing or integration with tools:
+
+.. code-block:: bash
+
+   conda export --format=environment-json --file=environment.json
+
+**Explicit Format**
+
+For exact environment reproduction on the same platform:
+
+.. code-block:: bash
+
+   conda export --format=explicit --file=explicit.txt
+
+Creates a file with full package URLs:
+
+.. code-block:: text
+
+   @EXPLICIT
+   https://repo.anaconda.com/pkgs/main/osx-64/python-3.9.7-h88f2d9e_0.tar.bz2
+   https://repo.anaconda.com/pkgs/main/osx-64/numpy-1.21.0-py39h2e5f516_0.tar.bz2
+
+**Requirements Format**
+
+For conda-compatible requirements files:
+
+.. code-block:: bash
+
+   conda export --format=requirements --file=requirements.txt
+
+Creates a file like:
+
+.. code-block:: text
+
+   python=3.9.7
+   numpy=1.21.0
+   pandas=1.3.0
+
+Cross-Platform Compatibility
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For maximum cross-platform compatibility, use the ``--from-history`` flag:
+
+.. code-block:: bash
+
+   conda export --from-history --format=environment-yaml
+
+This exports only explicitly installed packages, excluding platform-specific dependencies.
+
+.. note::
+   The ``--from-history`` flag only works with structured formats (``environment-yaml``,
+   ``environment-json``). It's not compatible with text formats (``explicit``, ``requirements``).
+
+Alternative: Traditional conda env export
+------------------------------------------
+
+You can also use the traditional ``conda env export`` command for YAML-only export:
 
 .. note::
    If you already have an ``environment.yml`` file in your
@@ -811,9 +958,15 @@ Exporting an environment file across platforms
 ----------------------------------------------
 
 If you want to make your environment file work across platforms,
-you can use the ``conda env export --from-history`` flag. This
-will only include packages that you’ve explicitly asked for,
-as opposed to including every package in your environment.
+you can use the ``--from-history`` flag with either command:
+
+.. code-block:: bash
+
+   # Enhanced export command (recommended)
+   conda export --from-history --format=environment-yaml
+
+   # Traditional command
+   conda env export --from-history
 
 For example, if you create an environment and install Python and a package::
 
@@ -823,13 +976,10 @@ This will download and install numerous additional packages to solve
 for dependencies. This will introduce packages that may not be compatible
 across platforms.
 
-If you use ``conda env export``, it will export all of those packages.
-However, if you use ``conda env export --from-history``, it will
-only export those you specifically chose:
+Both export commands with ``--from-history`` will export only the packages you specifically chose:
 
-.. code-block::
+.. code-block:: yaml
 
-   (env-name) ➜  ~ conda env export --from-history
    name: env-name
    channels:
      - conda-forge

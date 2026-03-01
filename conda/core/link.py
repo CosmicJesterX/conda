@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Package installation implemented as a series of link/unlink transactions."""
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
+from dataclasses import dataclass, fields
 import itertools
 import os
 import sys
@@ -37,6 +38,7 @@ from ..common.path import (
     get_python_site_packages_short_path,
 )
 from ..common.signals import signal_handler
+from ..deprecations import deprecated
 from ..exceptions import (
     CondaSystemExit,
     DisallowedPackageError,
@@ -45,6 +47,7 @@ from ..exceptions import (
     LinkError,
     RemoveError,
     SharedLinkPathClobberError,
+    SpecNotFoundInPackageCache,
     UnknownPackageClobberError,
     maybe_raise,
 )
@@ -53,7 +56,6 @@ from ..gateways.disk.delete import rm_rf
 from ..gateways.disk.read import isfile, lexists, read_package_info
 from ..gateways.disk.test import (
     hardlink_supported,
-    is_conda_environment,
     softlink_supported,
 )
 from ..gateways.subprocess import subprocess_call
@@ -77,17 +79,14 @@ from .path_actions import (
     UnregisterEnvironmentLocationAction,
     UpdateHistoryAction,
 )
-from .prefix_data import (
-    PrefixData,
-    python_record_for_prefix,
-)
+from .prefix_data import PrefixData
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Generator, Iterable
 
     from ..models.package_info import PackageInfo
     from ..models.records import PackageRecord
-    from .path_actions import _Action
+    from .path_actions import Action
 
 log = getLogger(__name__)
 
@@ -151,8 +150,11 @@ def make_unlink_actions(transaction_context, target_prefix, prefix_record):
     )
 
 
-def match_specs_to_dists(packages_info_to_link, specs):
-    matched_specs = [None for _ in range(len(packages_info_to_link))]
+def match_specs_to_dists(packages_info_to_link, specs) -> tuple[list[MatchSpec], ...]:
+    """
+    Find which specs belong to each package to link
+    """
+    matched_specs = [[] for _ in range(len(packages_info_to_link))]
     for spec in specs or ():
         spec = MatchSpec(spec)
         idx = next(
@@ -164,7 +166,7 @@ def match_specs_to_dists(packages_info_to_link, specs):
             None,
         )
         if idx is not None:
-            matched_specs[idx] = spec
+            matched_specs[idx].append(spec)
     return tuple(matched_specs)
 
 
@@ -180,10 +182,50 @@ class PrefixSetup(NamedTuple):
 class ActionGroup(NamedTuple):
     type: str
     pkg_data: PackageInfo | None
-    actions: Iterable[_Action]
+    actions: Iterable[Action]
     target_prefix: str
 
 
+@deprecated(
+    "25.9",
+    "26.3",
+    addendum="PrefixActions will be renamed to PrefixActionGroup in 26.3.",
+)
+@dataclass
+class PrefixActions:
+    """A container for groups of actions carried out during an UnlinkLinkTransaction.
+
+    :param remove_menu_action_groups: Actions which remove menu items
+    :param unlink_action_groups: Actions which unlink files
+    :param unregister_action_groups: Actions which unregister environment locations
+    :param link_action_groups: Actions which link files
+    :param register_action_groups: Actions which register environment locations
+    :param compile_action_groups: Actions which compile pyc files
+    :param make_menu_action_groups: Actions which create menu items
+    :param entry_point_action_groups: Actions which create python entry points
+    :param prefix_record_groups: Actions which create package json files in ``conda-meta/``
+    :param initial_action_groups: User-defined actions which run before all other actions
+    :param final_action_groups: User-defined actions which run after all other actions
+    """
+
+    remove_menu_action_groups: Iterable[ActionGroup]
+    unlink_action_groups: Iterable[ActionGroup]
+    unregister_action_groups: Iterable[ActionGroup]
+    link_action_groups: Iterable[ActionGroup]
+    register_action_groups: Iterable[ActionGroup]
+    compile_action_groups: Iterable[ActionGroup]
+    make_menu_action_groups: Iterable[ActionGroup]
+    entry_point_action_groups: Iterable[ActionGroup]
+    prefix_record_groups: Iterable[ActionGroup]
+    initial_action_groups: Iterable[ActionGroup] = ()
+    final_action_groups: Iterable[ActionGroup] = ()
+
+    def __iter__(self) -> Generator[Iterable[ActionGroup], None, None]:
+        for field in fields(self):
+            yield getattr(self, field.name)
+
+
+@deprecated("25.9", "26.3", addendum="Use PrefixActions instead.")
 class PrefixActionGroup(NamedTuple):
     remove_menu_action_groups: Iterable[ActionGroup]
     unlink_action_groups: Iterable[ActionGroup]
@@ -248,7 +290,7 @@ class UnlinkLinkTransaction:
         return not any(
             (stp.unlink_precs or stp.link_precs) for stp in self.prefix_setups.values()
         ) and all(
-            is_conda_environment(stp.target_prefix)
+            PrefixData(stp.target_prefix).is_environment()
             for stp in self.prefix_setups.values()
         )
 
@@ -271,7 +313,7 @@ class UnlinkLinkTransaction:
 
         with get_spinner("Preparing transaction"):
             for stp in self.prefix_setups.values():
-                grps = self._prepare(
+                self.prefix_action_groups[stp.target_prefix] = self._prepare(
                     self.transaction_context,
                     stp.target_prefix,
                     stp.unlink_precs,
@@ -280,7 +322,6 @@ class UnlinkLinkTransaction:
                     stp.update_specs,
                     stp.neutered_specs,
                 )
-                self.prefix_action_groups[stp.target_prefix] = PrefixActionGroup(*grps)
 
         self._prepared = True
 
@@ -289,7 +330,8 @@ class UnlinkLinkTransaction:
         if not self._prepared:
             self.prepare()
 
-        assert not context.dry_run
+        if context.dry_run:
+            raise RuntimeError("Cannot execute .verify() with dry-run enabled.")
 
         if context.safety_checks == SafetyChecks.disabled:
             self._verified = True
@@ -342,10 +384,12 @@ class UnlinkLinkTransaction:
         if not self._verified:
             self.verify()
 
-        assert not context.dry_run
+        if context.dry_run:
+            raise RuntimeError("Cannot run .execute() with dry-run enabled.")
+
         try:
-            # innermost dict.values() is an iterable of PrefixActionGroup namedtuple
-            # zip() is an iterable of each PrefixActionGroup namedtuple key
+            # innermost dict.values() is an iterable of PrefixActions
+            # instances; zip() is an iterable of each PrefixActions
             self._execute(
                 tuple(chain(*chain(*zip(*self.prefix_action_groups.values()))))
             )
@@ -400,7 +444,8 @@ class UnlinkLinkTransaction:
         pkg_cache_recs_to_link = tuple(
             PackageCacheData.get_entry_to_link(prec) for prec in link_precs
         )
-        assert all(pkg_cache_recs_to_link)
+        if not all(pkg_cache_recs_to_link):
+            raise SpecNotFoundInPackageCache("Some records cannot be found in cache.")
         packages_info_to_link = tuple(
             read_package_info(prec, pcrec)
             for prec, pcrec in zip(link_precs, pkg_cache_recs_to_link)
@@ -463,14 +508,14 @@ class UnlinkLinkTransaction:
         compile_action_groups = []
         make_menu_action_groups = []
         record_axns = []
-        for pkg_info, lt, spec in zip(
+        for pkg_info, lt, specs in zip(
             packages_info_to_link, link_types, matchspecs_for_link_dists
         ):
             link_ag = ActionGroup(
                 "link",
                 pkg_info,
                 cls._make_link_actions(
-                    transaction_context, pkg_info, target_prefix, lt, spec
+                    transaction_context, pkg_info, target_prefix, lt, specs
                 ),
                 target_prefix,
             )
@@ -484,7 +529,7 @@ class UnlinkLinkTransaction:
                     pkg_info,
                     target_prefix,
                     lt,
-                    spec,
+                    specs,
                     link_action_groups,
                 ),
                 target_prefix,
@@ -499,7 +544,7 @@ class UnlinkLinkTransaction:
                     pkg_info,
                     target_prefix,
                     lt,
-                    spec,
+                    specs,
                     link_action_groups,
                 ),
                 target_prefix,
@@ -528,7 +573,7 @@ class UnlinkLinkTransaction:
                     pkg_info,
                     target_prefix,
                     lt,
-                    spec,
+                    specs,
                     all_link_path_actions,
                 )
             )
@@ -552,7 +597,28 @@ class UnlinkLinkTransaction:
                 "register", None, register_actions + history_actions, target_prefix
             )
         ]
-        return PrefixActionGroup(
+
+        # Instantiate any pre or post transactions defined by the user.
+        pre_transaction_actions = context.plugin_manager.get_pre_transaction_actions(
+            transaction_context,
+            target_prefix,
+            unlink_precs,
+            link_precs,
+            remove_specs,
+            update_specs,
+            neutered_specs,
+        )
+        post_transaction_actions = context.plugin_manager.get_post_transaction_actions(
+            transaction_context,
+            target_prefix,
+            unlink_precs,
+            link_precs,
+            remove_specs,
+            update_specs,
+            neutered_specs,
+        )
+
+        return PrefixActions(
             remove_menu_action_groups,
             unlink_action_groups,
             unregister_action_groups,
@@ -562,6 +628,12 @@ class UnlinkLinkTransaction:
             make_menu_action_groups,
             entry_point_action_groups,
             prefix_record_groups,
+            initial_action_groups=[
+                ActionGroup("initial", None, pre_transaction_actions, target_prefix)
+            ],
+            final_action_groups=[
+                ActionGroup("final", None, post_transaction_actions, target_prefix)
+            ],
         )
 
     @staticmethod
@@ -837,10 +909,24 @@ class UnlinkLinkTransaction:
         remove_menu_actions = list(
             group for group in all_action_groups if group.type == "remove_menus"
         )
+        pre_transaction_actions = list(
+            group for group in all_action_groups if group.type == "initial"
+        )
+        post_transaction_actions = list(
+            group for group in all_action_groups if group.type == "final"
+        )
 
         with signal_handler(conda_signal_handler), time_recorder("unlink_link_execute"):
             exceptions = []
             with get_spinner("Executing transaction"):
+                # Execute any user-defined pre-transaction actions
+                for exc in self.execute_executor.map(
+                    UnlinkLinkTransaction._execute_actions,
+                    pre_transaction_actions,
+                ):
+                    if exc:
+                        exceptions.append(exc)
+
                 # Execute unlink actions
                 for group, register_group, install_side in (
                     (unlink_actions, "unregister", False),
@@ -886,8 +972,9 @@ class UnlinkLinkTransaction:
                     # parallel block 2:
                     composite_ag = []
                     if install_side:
-                        composite_ag.extend(record_actions)
                         # consolidate compile actions into one big'un for better efficiency
+                        # note: compile must run before record so that we capture pyc_file
+                        # sizes in the manifest.
                         individual_actions = [
                             axn for ag in compile_actions for axn in ag.actions
                         ]
@@ -903,6 +990,7 @@ class UnlinkLinkTransaction:
                                     composite.target_prefix,
                                 )
                             )
+                        composite_ag.extend(record_actions)
                     # functions return None unless there was an exception
                     for exc in self.execute_executor.map(
                         UnlinkLinkTransaction._execute_actions, composite_ag
@@ -927,6 +1015,15 @@ class UnlinkLinkTransaction:
                         #   call something that isn't there anymore
                         for axngroup in make_menu_actions:
                             UnlinkLinkTransaction._execute_actions(axngroup)
+
+                # Execute any user-defined post-transaction actions
+                for exc in self.execute_executor.map(
+                    UnlinkLinkTransaction._execute_actions,
+                    post_transaction_actions,
+                ):
+                    if exc:
+                        exceptions.append(exc)
+
             if exceptions:
                 # might be good to show all errors, but right now we only show the first
                 e = exceptions[0]
@@ -1076,7 +1173,8 @@ class UnlinkLinkTransaction:
         """
 
         def version_and_sp(python_record) -> tuple[str | None, str | None]:
-            assert python_record.version
+            if not python_record.version:
+                raise ValueError("Python record version is required.")
             python_version = get_major_minor_version(python_record.version)
             python_site_packages = python_record.python_site_packages_path
             if python_site_packages is None:
@@ -1097,7 +1195,7 @@ class UnlinkLinkTransaction:
             python_record = linking_new_python.repodata_record
             log.debug(f"found in current transaction python: {python_record}")
             return version_and_sp(python_record)
-        python_record = python_record_for_prefix(target_prefix)
+        python_record = PrefixData(target_prefix).get("python", None)
         if python_record:
             unlinking_python = next(
                 (
